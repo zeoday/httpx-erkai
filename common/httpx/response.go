@@ -1,9 +1,11 @@
 package httpx
 
 import (
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/projectdiscovery/tlsx/pkg/tlsx/clients"
 	httputil "github.com/projectdiscovery/utils/http"
 )
@@ -107,4 +109,33 @@ func (r *Response) GetChainLastURL() string {
 		return lastitem.RequestURL
 	}
 	return ""
+}
+
+func (r *Response) ExtractJSLink(inputUrl string) (jsLinks []string, err error) {
+	baseURL, _ := url.Parse(inputUrl)
+	// 读取响应数据
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(r.Raw))
+	if err != nil {
+		return jsLinks, err
+	}
+	// 获取所有的script标签
+	doc.Find("script[src]").Each(func(i int, s *goquery.Selection) {
+		link, exist := s.Attr("src")
+		if exist && strings.HasSuffix(link, ".js") {
+			absLink := toAbsURL(baseURL, link)
+			jsLinks = append(jsLinks, absLink)
+		}
+	})
+	return jsLinks, nil
+}
+
+func toAbsURL(baseURL *url.URL, link string) string {
+	u, err := url.Parse(link)
+	if err != nil {
+		return ""
+	}
+	if u.IsAbs() {
+		return u.String()
+	}
+	return baseURL.ResolveReference(u).String()
 }

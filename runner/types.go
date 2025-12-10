@@ -102,6 +102,7 @@ type Result struct {
 	Response           *httpx.Response               `json:"-" csv:"-" mapstructure:"-"`
 	FaviconData        []byte                        `json:"-" csv:"-" mapstructure:"-"`
 	Trace              *retryablehttp.TraceInfo      `json:"trace,omitempty" csv:"-"  mapstructure:"trace"`
+	JsLinks            []string                      `json:"js_links,omitempty" csv:"js_links" mapstructure:"js_links"`
 }
 
 type Trace struct {

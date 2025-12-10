@@ -327,6 +327,7 @@ type Options struct {
 	NoScreenshotBytes    bool
 	NoHeadlessBody       bool
 	NoScreenshotFullPage bool
+	NoSaveScreenshot     bool
 	ScreenshotTimeout    time.Duration
 	ScreenshotIdle       time.Duration
 	// HeadlessOptionalArguments specifies optional arguments to pass to Chrome
@@ -351,6 +352,10 @@ type Options struct {
 	OnClose func()
 
 	Trace bool
+
+	// Internal use only
+	BrowserPath     string
+	AvticeDetection bool
 
 	// Optional pre-created objects to reduce allocations
 	Wappalyzer     *wappalyzer.Wappalyze

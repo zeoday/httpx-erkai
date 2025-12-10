@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/corona10/goimagehash"
@@ -36,6 +37,7 @@ import (
 	"github.com/projectdiscovery/httpx/common/customextract"
 	"github.com/projectdiscovery/httpx/common/hashes/jarm"
 	"github.com/projectdiscovery/httpx/common/pagetypeclassifier"
+	"github.com/projectdiscovery/httpx/common/tech"
 	"github.com/projectdiscovery/httpx/static"
 	"github.com/projectdiscovery/mapcidr/asn"
 	"github.com/projectdiscovery/networkpolicy"
@@ -119,19 +121,19 @@ func New(options *Options) (*Runner, error) {
 		options: options,
 	}
 	var err error
-	if options.Wappalyzer != nil {
-		runner.wappalyzer = options.Wappalyzer
-	} else if options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
-		runner.wappalyzer, err = func() (*wappalyzer.Wappalyze, error) {
-			if options.CustomFingerprintFile != "" {
-				return wappalyzer.NewFromFile(options.CustomFingerprintFile, true, true)
-			}
-			return wappalyzer.New()
-		}()
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "could not create wappalyzer client")
-	}
+	// if options.Wappalyzer != nil {
+	// 	runner.wappalyzer = options.Wappalyzer
+	// } else if options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
+	// 	runner.wappalyzer, err = func() (*wappalyzer.Wappalyze, error) {
+	// 		if options.CustomFingerprintFile != "" {
+	// 			return wappalyzer.NewFromFile(options.CustomFingerprintFile, true, true)
+	// 		}
+	// 		return wappalyzer.New()
+	// 	}()
+	// }
+	// if err != nil {
+	// 	return nil, errors.Wrap(err, "could not create wappalyzer client")
+	// }
 
 	if options.StoreResponseDir != "" {
 		_ = os.RemoveAll(filepath.Join(options.StoreResponseDir, "response", "index.txt"))
@@ -303,7 +305,7 @@ func New(options *Options) (*Runner, error) {
 	scanopts.MaxResponseBodySizeToRead = options.MaxResponseBodySizeToRead
 	scanopts.extractRegexps = make(map[string]*regexp.Regexp)
 	if options.Screenshot {
-		browser, err := NewBrowser(options.HTTPProxy, options.UseInstalledChrome, options.ParseHeadlessOptionalArguments())
+		browser, err := NewBrowser(options.HTTPProxy, options.UseInstalledChrome, options.BrowserPath, options.ParseHeadlessOptionalArguments())
 		if err != nil {
 			return nil, err
 		}
@@ -774,7 +776,7 @@ func (r *Runner) RunEnumeration() {
 	}
 
 	// screenshot folder
-	if r.options.Screenshot {
+	if r.options.Screenshot && !r.options.NoSaveScreenshot {
 		screenshotFolder := filepath.Join(r.options.StoreResponseDir, "screenshot")
 		if err := os.MkdirAll(screenshotFolder, os.ModePerm); err != nil {
 			gologger.Fatal().Msgf("Could not create output screenshot directory '%s': %s\n", r.options.StoreResponseDir, err)
@@ -904,7 +906,7 @@ func (r *Runner) RunEnumeration() {
 			defer indexFile.Close() //nolint
 		}
 
-		if r.options.Screenshot {
+		if r.options.Screenshot && !r.options.NoSaveScreenshot {
 			var err error
 			indexScreenshotPath := filepath.Join(r.options.StoreResponseDir, "screenshot", "index_screenshot.txt")
 			if r.options.Resume {
@@ -1241,7 +1243,7 @@ func (r *Runner) RunEnumeration() {
 	go func(output chan Result) {
 		defer wgoutput.Done()
 
-		if r.options.Screenshot {
+		if r.options.Screenshot && !r.options.NoSaveScreenshot {
 			screenshotHtmlPath := filepath.Join(r.options.StoreResponseDir, "screenshot", "screenshot.html")
 			screenshotHtml, err := os.Create(screenshotHtmlPath)
 			if err != nil {
@@ -2053,15 +2055,15 @@ retry:
 		_, _ = fmt.Fprintf(builder, " [%s]", resp.Duration)
 	}
 
-	technologyDetails := make(map[string]wappalyzer.AppInfo)
-	var technologies []string
-	if scanopts.TechDetect {
-		matches := r.wappalyzer.FingerprintWithInfo(resp.Headers, resp.Data)
-		for match, data := range matches {
-			technologies = append(technologies, match)
-			technologyDetails[match] = data
-		}
-	}
+	// technologyDetails := make(map[string]wappalyzer.AppInfo)
+	// var technologies []string
+	// if scanopts.TechDetect {
+	// matches := r.wappalyzer.FingerprintWithInfo(resp.Headers, resp.Data)
+	// for match, data := range matches {
+	// 	technologies = append(technologies, match)
+	// 	technologyDetails[match] = data
+	// }
+	// }
 
 	var extractRegex []string
 	// extract regex
@@ -2108,6 +2110,112 @@ retry:
 			builder.WriteRune(']')
 		} else {
 			gologger.Warning().Msgf("could not calculate favicon hash for path %v : %s", faviconPath, err)
+		}
+	}
+	var techDetector *tech.Detector
+	technologyDetails := make(map[string]wappalyzer.AppInfo)
+	var technologies []string
+	if scanopts.TechDetect && r.options.CustomFingerprintFile != "" {
+		techDetector, err = tech.NewDetector(r.options.CustomFingerprintFile, true)
+		if err != nil {
+			gologger.Warning().Msgf("could not create technology detector: %s", err)
+		} else {
+			product, err := techDetector.Detect(fullURL, "/", method, faviconMMH3, resp)
+			if err != nil {
+				gologger.Warning().Msgf("detect tech error: %s", err)
+			}
+			if len(product) > 0 {
+				technologies = append(technologies, product...)
+				techDetector.AddMatchedProduct(fullURL, product)
+			}
+			product, err = techDetector.DetectWithNuclei(fullURL, "/", method, string(faviconData), resp)
+			if err != nil {
+				gologger.Warning().Msgf("nuclei detect tech error: %s", err)
+			}
+			if len(product) > 0 {
+				technologies = append(technologies, product...)
+				techDetector.AddMatchedProduct(fullURL, product)
+			}
+			if r.options.AvticeDetection {
+				var mu sync.Mutex
+				var ctx, cancel = context.WithCancel(context.Background())
+				defer cancel()
+
+				eg, ctx := errgroup.WithContext(ctx)
+				eg.SetLimit(10)
+				visited := make(map[string]struct{})
+				visited["/"] = struct{}{}
+				for _, rule := range techDetector.GetAllPaths() {
+					if ctx.Err() != nil {
+						break
+					}
+					hp2 := hp
+					if rule.Redirect {
+						hp2.Options.FollowRedirects = true
+					} else {
+						hp2.Options.FollowRedirects = false
+					}
+					if rule.Path == "" {
+						continue
+					}
+					if _, ok := visited[rule.Path]; ok {
+						if rule.Headers == nil {
+							continue
+						}
+					}
+					visited[rule.Path] = struct{}{}
+					path := rule.Path
+					method := method
+					headers := rule.Headers
+					u := URL.Clone()
+
+					eg.Go(func() error {
+						if err := u.MergePath(path, scanopts.Unsafe); err != nil {
+							gologger.Debug().Msgf("failed to merge paths of url %v and %v", u.String(), path)
+							return err
+						}
+						techReq, err := hp2.NewRequest(method, u.String())
+						if err != nil {
+							gologger.Warning().Msgf("failed to create request for %s: %s", u.String(), err)
+							return err
+						}
+						if headers != nil {
+							hp2.SetCustomHeaders(techReq, headers)
+						}
+						techResp, err := hp2.Do(techReq, httpx.UnsafeOptions{URIPath: reqURI})
+						if r.options.ShowStatistics {
+							r.stats.IncrementCounter("requests", 1)
+						}
+						if err != nil {
+							gologger.Debug().Msgf("error requesting %s: %s", u.String(), err)
+							return nil
+						}
+						mu.Lock()
+						defer mu.Unlock()
+						product, err := techDetector.Detect(fullURL, rule.Path, method, "", techResp)
+						if err != nil {
+							gologger.Warning().Msgf("detect tech error: %s", err)
+							return err
+						}
+						if len(product) > 0 {
+							technologies = append(technologies, product...)
+							cancel()
+						}
+						product, err = techDetector.DetectWithNuclei(fullURL, rule.Path, method, faviconMMH3, techResp)
+						if err != nil {
+							gologger.Warning().Msgf("nuclei detect tech error: %s", err)
+						}
+						if len(product) > 0 {
+							technologies = append(technologies, product...)
+							cancel()
+						}
+						return nil
+					})
+				}
+				if err := eg.Wait(); err != nil {
+					gologger.Warning().Msgf("error while detecting technologies: %s", err)
+				}
+			}
 		}
 	}
 
@@ -2282,10 +2390,34 @@ retry:
 			// more technologies in the response. This is a quick trick to get
 			// more detected technologies.
 			if r.options.TechDetect || r.options.JSONOutput || r.options.CSVOutput {
-				moreMatches := r.wappalyzer.FingerprintWithInfo(resp.Headers, []byte(headlessBody))
-				for match, data := range moreMatches {
-					technologies = append(technologies, match)
-					technologyDetails[match] = data
+
+				// moreMatches := r.wappalyzer.FingerprintWithInfo(resp.Headers, []byte(headlessBody))
+				// for match, data := range moreMatches {
+				// 	technologies = append(technologies, match)
+				// 	technologyDetails[match] = data
+				// }
+				// extract title again from headless body
+				newResp := resp
+				newResp.Data = []byte(headlessBody)
+				newResp.Raw = headlessBody
+
+				if httpx.ExtractTitle(newResp) != "" {
+					title = httpx.ExtractTitle(newResp)
+				}
+				products, err := techDetector.Detect(fullURL, "/", "GET", "", newResp)
+				if err != nil {
+					gologger.Warning().Msgf("detect tech error: %s", err)
+				}
+				if len(products) > 0 {
+					technologies = append(technologies, products...)
+				}
+
+				products, err = techDetector.DetectWithNuclei(fullURL, "/", "GET", "", newResp)
+				if err != nil {
+					gologger.Warning().Msgf("detect tech error: %s", err)
+				}
+				if len(products) > 0 {
+					technologies = append(technologies, products...)
 				}
 				technologies = sliceutil.Dedupe(technologies)
 			}
@@ -2293,6 +2425,15 @@ retry:
 		if scanopts.NoHeadlessBody {
 			headlessBody = ""
 		}
+	}
+
+	var jsLink []string
+	jsLink, err = resp.ExtractJSLink(fullURL)
+	if err != nil {
+		gologger.Warning().Msgf("extract js link error: %s", err)
+	}
+	if len(jsLink) > 0 {
+		builder.WriteString(" [" + strings.Join(jsLink, ",") + "]")
 	}
 
 	if scanopts.TechDetect && len(technologies) > 0 {
@@ -2374,6 +2515,7 @@ retry:
 		RequestRaw:        requestDump,
 		Response:          resp,
 		FaviconData:       faviconData,
+		JsLinks:           jsLink,
 	}
 	if resp.BodyDomains != nil {
 		result.Fqdns = resp.BodyDomains.Fqdns
