@@ -25,6 +25,7 @@ import (
 	fileutilz "github.com/projectdiscovery/httpx/common/fileutil"
 	"github.com/projectdiscovery/httpx/common/httpx"
 	"github.com/projectdiscovery/httpx/common/stringz"
+	"github.com/projectdiscovery/httpx/common/tech"
 	"github.com/projectdiscovery/networkpolicy"
 	pdcpauth "github.com/projectdiscovery/utils/auth/pdcp"
 	"github.com/projectdiscovery/utils/env"
@@ -361,6 +362,9 @@ type Options struct {
 	Wappalyzer     *wappalyzer.Wappalyze
 	Networkpolicy  *networkpolicy.NetworkPolicy
 	CDNCheckClient *cdncheck.Client
+	TechAnalyzer   *tech.Detector
+
+	UseInternalTech bool
 }
 
 // ParseOptions parses the command line options for application

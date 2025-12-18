@@ -83,6 +83,7 @@ type Runner struct {
 	options            *Options
 	hp                 *httpx.HTTPX
 	wappalyzer         *wappalyzer.Wappalyze
+	techAnalyzer       *tech.Detector
 	scanopts           ScanOptions
 	hm                 *hybrid.HybridMap
 	excludeCdn         bool
@@ -121,6 +122,14 @@ func New(options *Options) (*Runner, error) {
 		options: options,
 	}
 	var err error
+	if options.TechAnalyzer != nil {
+		runner.techAnalyzer = options.TechAnalyzer
+	} else if options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
+		runner.techAnalyzer, err = tech.NewDetector(options.CustomFingerprintFile, options.UseInternalTech)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not create technology detector")
+		}
+	}
 	// if options.Wappalyzer != nil {
 	// 	runner.wappalyzer = options.Wappalyzer
 	// } else if options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
@@ -2112,111 +2121,107 @@ retry:
 			gologger.Warning().Msgf("could not calculate favicon hash for path %v : %s", faviconPath, err)
 		}
 	}
-	var techDetector *tech.Detector
+
 	technologyDetails := make(map[string]wappalyzer.AppInfo)
 	var technologies []string
 	if scanopts.TechDetect && r.options.CustomFingerprintFile != "" {
-		techDetector, err = tech.NewDetector(r.options.CustomFingerprintFile, true)
+		product, err := r.techAnalyzer.Detect(fullURL, "/", method, faviconMMH3, resp)
 		if err != nil {
-			gologger.Warning().Msgf("could not create technology detector: %s", err)
-		} else {
-			product, err := techDetector.Detect(fullURL, "/", method, faviconMMH3, resp)
-			if err != nil {
-				gologger.Warning().Msgf("detect tech error: %s", err)
-			}
-			if len(product) > 0 {
-				technologies = append(technologies, product...)
-				techDetector.AddMatchedProduct(fullURL, product)
-			}
-			product, err = techDetector.DetectWithNuclei(fullURL, "/", method, string(faviconData), resp)
-			if err != nil {
-				gologger.Warning().Msgf("nuclei detect tech error: %s", err)
-			}
-			if len(product) > 0 {
-				technologies = append(technologies, product...)
-				techDetector.AddMatchedProduct(fullURL, product)
-			}
-			if r.options.AvticeDetection {
-				var mu sync.Mutex
-				var ctx, cancel = context.WithCancel(context.Background())
-				defer cancel()
+			gologger.Warning().Msgf("detect tech error: %s", err)
+		}
+		if len(product) > 0 {
+			technologies = append(technologies, product...)
+			r.techAnalyzer.AddMatchedProduct(fullURL, product)
+		}
+		product, err = r.techAnalyzer.DetectWithNuclei(fullURL, "/", method, string(faviconData), resp)
+		if err != nil {
+			gologger.Warning().Msgf("nuclei detect tech error: %s", err)
+		}
+		if len(product) > 0 {
+			technologies = append(technologies, product...)
+			r.techAnalyzer.AddMatchedProduct(fullURL, product)
+		}
+		if r.options.AvticeDetection {
+			var mu sync.Mutex
+			var ctx, cancel = context.WithCancel(context.Background())
+			defer cancel()
 
-				eg, ctx := errgroup.WithContext(ctx)
-				eg.SetLimit(10)
-				visited := make(map[string]struct{})
-				visited["/"] = struct{}{}
-				for _, rule := range techDetector.GetAllPaths() {
-					if ctx.Err() != nil {
-						break
-					}
-					hp2 := hp
-					if rule.Redirect {
-						hp2.Options.FollowRedirects = true
-					} else {
-						hp2.Options.FollowRedirects = false
-					}
-					if rule.Path == "" {
+			eg, ctx := errgroup.WithContext(ctx)
+			eg.SetLimit(10)
+			visited := make(map[string]struct{})
+			visited["/"] = struct{}{}
+			for _, rule := range r.techAnalyzer.GetAllPaths() {
+				if ctx.Err() != nil {
+					break
+				}
+				hp2 := hp
+				if rule.Redirect {
+					hp2.Options.FollowRedirects = true
+				} else {
+					hp2.Options.FollowRedirects = false
+				}
+				if rule.Path == "" {
+					continue
+				}
+				if _, ok := visited[rule.Path]; ok {
+					if rule.Headers == nil {
 						continue
 					}
-					if _, ok := visited[rule.Path]; ok {
-						if rule.Headers == nil {
-							continue
-						}
-					}
-					visited[rule.Path] = struct{}{}
-					path := rule.Path
-					method := method
-					headers := rule.Headers
-					u := URL.Clone()
+				}
+				visited[rule.Path] = struct{}{}
+				path := rule.Path
+				method := method
+				headers := rule.Headers
+				u := URL.Clone()
 
-					eg.Go(func() error {
-						if err := u.MergePath(path, scanopts.Unsafe); err != nil {
-							gologger.Debug().Msgf("failed to merge paths of url %v and %v", u.String(), path)
-							return err
-						}
-						techReq, err := hp2.NewRequest(method, u.String())
-						if err != nil {
-							gologger.Warning().Msgf("failed to create request for %s: %s", u.String(), err)
-							return err
-						}
-						if headers != nil {
-							hp2.SetCustomHeaders(techReq, headers)
-						}
-						techResp, err := hp2.Do(techReq, httpx.UnsafeOptions{URIPath: reqURI})
-						if r.options.ShowStatistics {
-							r.stats.IncrementCounter("requests", 1)
-						}
-						if err != nil {
-							gologger.Debug().Msgf("error requesting %s: %s", u.String(), err)
-							return nil
-						}
-						mu.Lock()
-						defer mu.Unlock()
-						product, err := techDetector.Detect(fullURL, rule.Path, method, "", techResp)
-						if err != nil {
-							gologger.Warning().Msgf("detect tech error: %s", err)
-							return err
-						}
-						if len(product) > 0 {
-							technologies = append(technologies, product...)
-							cancel()
-						}
-						product, err = techDetector.DetectWithNuclei(fullURL, rule.Path, method, faviconMMH3, techResp)
-						if err != nil {
-							gologger.Warning().Msgf("nuclei detect tech error: %s", err)
-						}
-						if len(product) > 0 {
-							technologies = append(technologies, product...)
-							cancel()
-						}
+				eg.Go(func() error {
+					if err := u.MergePath(path, scanopts.Unsafe); err != nil {
+						gologger.Debug().Msgf("failed to merge paths of url %v and %v", u.String(), path)
+						return err
+					}
+					techReq, err := hp2.NewRequest(method, u.String())
+					if err != nil {
+						gologger.Warning().Msgf("failed to create request for %s: %s", u.String(), err)
+						return err
+					}
+					if headers != nil {
+						hp2.SetCustomHeaders(techReq, headers)
+					}
+					techResp, err := hp2.Do(techReq, httpx.UnsafeOptions{URIPath: reqURI})
+					if r.options.ShowStatistics {
+						r.stats.IncrementCounter("requests", 1)
+					}
+					if err != nil {
+						gologger.Debug().Msgf("error requesting %s: %s", u.String(), err)
 						return nil
-					})
-				}
-				if err := eg.Wait(); err != nil {
-					gologger.Warning().Msgf("error while detecting technologies: %s", err)
-				}
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					product, err := r.techAnalyzer.Detect(fullURL, rule.Path, method, "", techResp)
+					if err != nil {
+						gologger.Warning().Msgf("detect tech error: %s", err)
+						return err
+					}
+					if len(product) > 0 {
+						technologies = append(technologies, product...)
+						cancel()
+					}
+					product, err = r.techAnalyzer.DetectWithNuclei(fullURL, rule.Path, method, faviconMMH3, techResp)
+					if err != nil {
+						gologger.Warning().Msgf("nuclei detect tech error: %s", err)
+					}
+					if len(product) > 0 {
+						technologies = append(technologies, product...)
+						cancel()
+					}
+					return nil
+				})
+			}
+			if err := eg.Wait(); err != nil {
+				gologger.Warning().Msgf("error while detecting technologies: %s", err)
 			}
 		}
+
 	}
 
 	hashesMap := make(map[string]interface{})
@@ -2404,7 +2409,7 @@ retry:
 				if httpx.ExtractTitle(newResp) != "" {
 					title = httpx.ExtractTitle(newResp)
 				}
-				products, err := techDetector.Detect(fullURL, "/", "GET", "", newResp)
+				products, err := r.techAnalyzer.Detect(fullURL, "/", "GET", "", newResp)
 				if err != nil {
 					gologger.Warning().Msgf("detect tech error: %s", err)
 				}
@@ -2412,7 +2417,7 @@ retry:
 					technologies = append(technologies, products...)
 				}
 
-				products, err = techDetector.DetectWithNuclei(fullURL, "/", "GET", "", newResp)
+				products, err = r.techAnalyzer.DetectWithNuclei(fullURL, "/", "GET", "", newResp)
 				if err != nil {
 					gologger.Warning().Msgf("detect tech error: %s", err)
 				}

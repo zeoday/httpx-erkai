@@ -57,6 +57,11 @@ func (p *ruleParser) parseDSLRule(content []byte) error {
 		return errors.New("product name is empty")
 	}
 
+	// 如果产品已存在规则，跳过（避免重复加载）
+	if _, exists := p.rawDSL[product]; exists {
+		return nil
+	}
+
 	for _, rule := range m.Rules {
 		if rule.DSL == "" {
 			continue
@@ -88,6 +93,11 @@ func (p *ruleParser) parseNucleiRule(content []byte) error {
 
 	p.store.mu.Lock()
 	defer p.store.mu.Unlock()
+
+	// 如果产品已存在规则，跳过（避免重复加载）
+	if _, exists := p.store.nucleiRules[product]; exists {
+		return nil
+	}
 
 	for _, req := range t.RequestsWithHTTP {
 		compiled := req.Compile()
@@ -134,6 +144,10 @@ func (p *ruleParser) compileAllDSLRules() {
 			})
 		}
 	}
+
+	// 清理原始DSL数据以释放内存
+	p.rawDSL = nil
+	p.helperFunc = nil
 }
 
 // ============================================================================
