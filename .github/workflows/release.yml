@@ -2,8 +2,11 @@ name: 🎉 Release Binary
 
 on:
   push:
+    branches:
+      - dev
+      - main
     tags:
-      - '*'
+      - 'v*.*.*'  # 只匹配版本号格式的tag，如 v1.0.0
   workflow_dispatch:
 
 jobs:
@@ -20,6 +23,17 @@ jobs:
         with: 
           go-version: 1.21.x
       
+      - name: "Determine release type"
+        id: release-type
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "release_name=Release ${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "release_name=Dev Build $(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+          fi
+      
       - name: "Create release on GitHub"
         uses: goreleaser/goreleaser-action@v4
         with: 
@@ -28,6 +42,7 @@ jobs:
           workdir: .
         env: 
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GORELEASER_CURRENT_TAG: "${{ steps.release-type.outputs.release_name }}"
           SLACK_WEBHOOK: "${{ secrets.RELEASE_SLACK_WEBHOOK }}"
           DISCORD_WEBHOOK_ID: "${{ secrets.DISCORD_WEBHOOK_ID }}"
           DISCORD_WEBHOOK_TOKEN: "${{ secrets.DISCORD_WEBHOOK_TOKEN }}"
