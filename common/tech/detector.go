@@ -100,18 +100,21 @@ func (d *Detector) loadRules(rulePath string) error {
 // loadInternalRules 加载内置规则
 func (d *Detector) loadInternalRules(parser *ruleParser) error {
 	fpDir := "data/fp"
-	files, err := embed.AssetDir(fpDir)
+	files, err := embed.AssetAllDir(fpDir)
 	if err != nil {
 		return errors.New("internal rules directory not found: " + err.Error())
 	}
 
 	for _, fileName := range files {
-		content, err := embed.Asset(path.Join(fpDir, fileName))
+		content, err := embed.Asset(fileName)
 		if err != nil {
 			continue
 		}
-		if err := parser.parseDSLRule(content); err != nil {
-			gologger.Error().Msgf("parse internal rule %s: %s", fileName, err)
+		if err := parser.parseNucleiRule(content); err != nil {
+			gologger.Warning().Msgf("parse internal rule %s: %s", fileName, err)
+			if err := parser.parseDSLRule(content); err != nil {
+				gologger.Warning().Msgf("parse internal rule error: %s: %s", fileName, err)
+			}
 		}
 	}
 

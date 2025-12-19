@@ -2124,7 +2124,7 @@ retry:
 
 	technologyDetails := make(map[string]wappalyzer.AppInfo)
 	var technologies []string
-	if scanopts.TechDetect && r.options.CustomFingerprintFile != "" {
+	if scanopts.TechDetect {
 		product, err := r.techAnalyzer.Detect(fullURL, "/", method, faviconMMH3, resp)
 		if err != nil {
 			gologger.Warning().Msgf("detect tech error: %s", err)

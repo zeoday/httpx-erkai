@@ -18,7 +18,33 @@ func Asset(name string) ([]byte, error) {
 	}
 	return buf, err
 }
+func AssetAllDir(name string) ([]string, error) {
+	entries := make([]string, 0)
+	err := walkDir(name, &entries)
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
 
+func walkDir(name string, entries *[]string) error {
+	dir, err := FS.ReadDir(name)
+	if err != nil {
+		return err
+	}
+	for _, v := range dir {
+		fullPath := name + "/" + v.Name()
+		if v.IsDir() {
+			// 递归遍历子目录
+			if err := walkDir(fullPath, entries); err != nil {
+				return err
+			}
+		} else {
+			*entries = append(*entries, fullPath)
+		}
+	}
+	return nil
+}
 func AssetDir(name string) ([]string, error) {
 	dir, err := FS.ReadDir(name)
 	if err != nil {
