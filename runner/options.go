@@ -356,7 +356,7 @@ type Options struct {
 
 	// Internal use only
 	BrowserPath     string
-	AvticeDetection bool
+	AvtiveDetection bool
 
 	// Optional pre-created objects to reduce allocations
 	Wappalyzer     *wappalyzer.Wappalyze
@@ -397,6 +397,7 @@ func ParseOptions() *Options {
 		flagSet.BoolVarP(&options.OutputServerHeader, "web-server", "server", false, "display server name"),
 		flagSet.BoolVarP(&options.TechDetect, "tech-detect", "td", false, "display technology in use based on wappalyzer dataset"),
 		flagSet.BoolVarP(&options.UseInternalTech, "use-internal-tech", "uit", false, "use internal tech rule"),
+		flagSet.BoolVarP(&options.AvtiveDetection, "tech-active", "ta", false, "By detecting path to identify fingerprints"),
 		flagSet.StringVarP(&options.CustomFingerprintFile, "custom-fingerprint-file", "cff", "", "path to a custom fingerprint file for technology detection"),
 		flagSet.BoolVar(&options.OutputMethod, "method", false, "display http request method"),
 		flagSet.BoolVarP(&options.OutputWebSocket, "websocket", "ws", false, "display server using websocket"),

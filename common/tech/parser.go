@@ -19,9 +19,11 @@ type ruleParser struct {
 }
 
 type rawDSLRule struct {
-	Method string
-	Paths  []string
-	DSL    string
+	Method   string
+	Paths    []string
+	Headers  map[string]string
+	Redirect bool
+	DSL      string
 }
 
 func newRuleParser(store *RuleStore) *ruleParser {
@@ -71,9 +73,11 @@ func (p *ruleParser) parseDSLRule(content []byte) error {
 			paths = []string{"/"}
 		}
 		p.rawDSL[product] = append(p.rawDSL[product], rawDSLRule{
-			Method: rule.Method,
-			Paths:  paths,
-			DSL:    rule.DSL,
+			Method:   rule.Method,
+			Paths:    paths,
+			Headers:  rule.Headers,
+			Redirect: rule.Redirect,
+			DSL:      rule.DSL,
 		})
 	}
 	return nil
@@ -118,6 +122,8 @@ func (p *ruleParser) parseNucleiRule(content []byte) error {
 		p.store.nucleiRules[product] = append(p.store.nucleiRules[product], &CompiledNucleiRule{
 			Method:     method,
 			Paths:      paths,
+			Headers:    req.Headers,
+			Redirect:   false, // Nuclei规则默认不跟随重定向
 			Expression: compiled,
 		})
 	}
@@ -140,6 +146,8 @@ func (p *ruleParser) compileAllDSLRules() {
 			p.store.dslRules[product] = append(p.store.dslRules[product], &CompiledRule{
 				Method:     rule.Method,
 				Paths:      rule.Paths,
+				Headers:    rule.Headers,
+				Redirect:   rule.Redirect,
 				Expression: expr,
 			})
 		}

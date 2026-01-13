@@ -2141,7 +2141,7 @@ retry:
 			technologies = append(technologies, product...)
 			r.techAnalyzer.AddMatchedProduct(fullURL, product)
 		}
-		if r.options.AvticeDetection {
+		if r.options.AvtiveDetection {
 			var mu sync.Mutex
 			var ctx, cancel = context.WithCancel(context.Background())
 			defer cancel()

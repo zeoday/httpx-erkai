@@ -46,6 +46,8 @@ type RuleStore struct {
 type CompiledRule struct {
 	Method     string
 	Paths      []string
+	Headers    map[string]string
+	Redirect   bool
 	Expression *govaluate.EvaluableExpression
 }
 
@@ -53,6 +55,8 @@ type CompiledRule struct {
 type CompiledNucleiRule struct {
 	Method     string
 	Paths      []string
+	Headers    map[string]string
+	Redirect   bool
 	Expression *operators.Operators
 }
 
@@ -476,7 +480,6 @@ func (d *Detector) Extract(data map[string]interface{}, extractor *extractors.Ex
 }
 
 // GetAllPaths 获取所有需要探测的路径规则
-// 结果会被缓存，避免重复构建
 func (d *Detector) GetAllPaths() []PathRule {
 	// 使用sync.Once确保只构建一次
 	d.pathsCacheOnce.Do(func() {
@@ -493,12 +496,15 @@ func (d *Detector) GetAllPaths() []PathRule {
 					if p == "" {
 						p = "/"
 					}
-					key := rule.Method + ":" + p
+					// 构建唯一key：包含Method、Path和Headers
+					key := buildPathRuleKey(rule.Method, p, rule.Headers)
 					if _, ok := seen[key]; !ok {
 						seen[key] = struct{}{}
 						paths = append(paths, PathRule{
-							Method: rule.Method,
-							Path:   p,
+							Method:   rule.Method,
+							Path:     p,
+							Headers:  rule.Headers,
+							Redirect: rule.Redirect,
 						})
 					}
 				}
@@ -512,12 +518,15 @@ func (d *Detector) GetAllPaths() []PathRule {
 					if p == "" {
 						p = "/"
 					}
-					key := rule.Method + ":" + p
+					// 构建唯一key：包含Method、Path和Headers
+					key := buildPathRuleKey(rule.Method, p, rule.Headers)
 					if _, ok := seen[key]; !ok {
 						seen[key] = struct{}{}
 						paths = append(paths, PathRule{
-							Method: rule.Method,
-							Path:   p,
+							Method:   rule.Method,
+							Path:     p,
+							Headers:  rule.Headers,
+							Redirect: rule.Redirect,
 						})
 					}
 				}
@@ -541,6 +550,31 @@ type PathRule struct {
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+// buildPathRuleKey 构建路径规则的唯一key
+// 格式: METHOD:PATH[:HEADER1=VALUE1:HEADER2=VALUE2...]
+func buildPathRuleKey(method, path string, headers map[string]string) string {
+	key := method + ":" + path
+	if len(headers) > 0 {
+		// 对headers按key排序后拼接，确保相同headers的规则生成相同key
+		var headerParts []string
+		for k, v := range headers {
+			headerParts = append(headerParts, k+"="+v)
+		}
+		// 简单排序以保证一致性
+		for i := 0; i < len(headerParts)-1; i++ {
+			for j := i + 1; j < len(headerParts); j++ {
+				if headerParts[i] > headerParts[j] {
+					headerParts[i], headerParts[j] = headerParts[j], headerParts[i]
+				}
+			}
+		}
+		for _, part := range headerParts {
+			key += ":" + part
+		}
+	}
+	return key
+}
 
 // matchPath 检查路径和方法是否匹配
 func matchPath(reqPath, reqMethod, ruleMethod string, rulePaths []string) bool {
