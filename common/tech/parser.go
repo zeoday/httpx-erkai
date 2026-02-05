@@ -19,9 +19,11 @@ type ruleParser struct {
 }
 
 type rawDSLRule struct {
-	Method string
-	Paths  []string
-	DSL    string
+	Method   string
+	Paths    []string
+	Headers  map[string]string
+	Redirect bool
+	DSL      string
 }
 
 func newRuleParser(store *RuleStore) *ruleParser {
@@ -57,6 +59,11 @@ func (p *ruleParser) parseDSLRule(content []byte) error {
 		return errors.New("product name is empty")
 	}
 
+	// 如果产品已存在规则，跳过（避免重复加载）
+	if _, exists := p.rawDSL[product]; exists {
+		return nil
+	}
+
 	for _, rule := range m.Rules {
 		if rule.DSL == "" {
 			continue
@@ -66,9 +73,11 @@ func (p *ruleParser) parseDSLRule(content []byte) error {
 			paths = []string{"/"}
 		}
 		p.rawDSL[product] = append(p.rawDSL[product], rawDSLRule{
-			Method: rule.Method,
-			Paths:  paths,
-			DSL:    rule.DSL,
+			Method:   rule.Method,
+			Paths:    paths,
+			Headers:  rule.Headers,
+			Redirect: rule.Redirect,
+			DSL:      rule.DSL,
 		})
 	}
 	return nil
@@ -89,6 +98,11 @@ func (p *ruleParser) parseNucleiRule(content []byte) error {
 	p.store.mu.Lock()
 	defer p.store.mu.Unlock()
 
+	// 如果产品已存在规则，跳过（避免重复加载）
+	if _, exists := p.store.nucleiRules[product]; exists {
+		return nil
+	}
+
 	for _, req := range t.RequestsWithHTTP {
 		compiled := req.Compile()
 		if compiled == nil {
@@ -108,6 +122,8 @@ func (p *ruleParser) parseNucleiRule(content []byte) error {
 		p.store.nucleiRules[product] = append(p.store.nucleiRules[product], &CompiledNucleiRule{
 			Method:     method,
 			Paths:      paths,
+			Headers:    req.Headers,
+			Redirect:   false, // Nuclei规则默认不跟随重定向
 			Expression: compiled,
 		})
 	}
@@ -130,10 +146,16 @@ func (p *ruleParser) compileAllDSLRules() {
 			p.store.dslRules[product] = append(p.store.dslRules[product], &CompiledRule{
 				Method:     rule.Method,
 				Paths:      rule.Paths,
+				Headers:    rule.Headers,
+				Redirect:   rule.Redirect,
 				Expression: expr,
 			})
 		}
 	}
+
+	// 清理原始DSL数据以释放内存
+	p.rawDSL = nil
+	p.helperFunc = nil
 }
 
 // ============================================================================

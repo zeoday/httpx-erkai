@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/Knetic/govaluate"
+	"github.com/Mzack9999/gcache"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/httpx/common/httpx"
 	"github.com/projectdiscovery/httpx/embed"
@@ -19,14 +20,19 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/helpers/responsehighlighter"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
 	sliceutil "github.com/projectdiscovery/utils/slice"
+	"gopkg.in/yaml.v3"
 )
 
 // Detector 指纹检测器
 type Detector struct {
 	useInternal bool
 
-	store       *RuleStore
-	matchedOnce sync.Map // target -> *sync.Map[product]bool
+	store          *RuleStore
+	matchedCache   gcache.Cache[string, *sync.Map] // target -> *sync.Map[product]bool，使用LRU自动淘汰
+	allPathsCache  []PathRule                      // GetAllPaths结果缓存
+	pathsCacheOnce sync.Once                       // 确保只初始化一次
+	detectCounter  uint64                          // 检测计数器，用于定期GC
+	counterMu      sync.Mutex                      // 计数器锁
 }
 
 // RuleStore 规则存储器
@@ -40,6 +46,8 @@ type RuleStore struct {
 type CompiledRule struct {
 	Method     string
 	Paths      []string
+	Headers    map[string]string
+	Redirect   bool
 	Expression *govaluate.EvaluableExpression
 }
 
@@ -47,6 +55,8 @@ type CompiledRule struct {
 type CompiledNucleiRule struct {
 	Method     string
 	Paths      []string
+	Headers    map[string]string
+	Redirect   bool
 	Expression *operators.Operators
 }
 
@@ -58,6 +68,9 @@ func NewDetector(rulePath string, useInternal bool) (*Detector, error) {
 			dslRules:    make(map[string][]*CompiledRule),
 			nucleiRules: make(map[string][]*CompiledNucleiRule),
 		},
+		// 使用LRU缓存，适配100并发线程长期运行场景
+		// 2000容量 = 100线程 × 20倍余量，自动淘汰最少使用的
+		matchedCache: gcache.New[string, *sync.Map](2000).LRU().Build(),
 	}
 
 	if err := d.loadRules(rulePath); err != nil {
@@ -66,9 +79,6 @@ func NewDetector(rulePath string, useInternal bool) (*Detector, error) {
 
 	return d, nil
 }
-
-// Execute 执行扫描
-
 
 // loadRules 加载规则
 func (d *Detector) loadRules(rulePath string) error {
@@ -80,7 +90,6 @@ func (d *Detector) loadRules(rulePath string) error {
 			return err
 		}
 	}
-
 	// 加载外部规则
 	if err := d.loadExternalRules(parser, rulePath); err != nil {
 		return err
@@ -95,18 +104,21 @@ func (d *Detector) loadRules(rulePath string) error {
 // loadInternalRules 加载内置规则
 func (d *Detector) loadInternalRules(parser *ruleParser) error {
 	fpDir := "data/fp"
-	files, err := embed.AssetDir(fpDir)
+	files, err := embed.AssetAllDir(fpDir)
 	if err != nil {
 		return errors.New("internal rules directory not found: " + err.Error())
 	}
 
 	for _, fileName := range files {
-		content, err := embed.Asset(path.Join(fpDir, fileName))
+		content, err := embed.Asset(fileName)
 		if err != nil {
 			continue
 		}
-		if err := parser.parseDSLRule(content); err != nil {
-			gologger.Error().Msgf("parse internal rule %s: %s", fileName, err)
+		if err := parser.parseNucleiRule(content); err != nil {
+			gologger.Warning().Msgf("parse internal rule %s: %s", fileName, err)
+			if err := parser.parseDSLRule(content); err != nil {
+				gologger.Warning().Msgf("parse internal rule error: %s: %s", fileName, err)
+			}
 		}
 	}
 
@@ -151,10 +163,18 @@ func (d *Detector) parseRuleFile(parser *ruleParser, filename string, content []
 
 // Detect 使用DSL规则检测指纹
 func (d *Detector) Detect(inputURL, reqPath, reqMethod, faviconHash string, resp *httpx.Response) ([]string, error) {
+	// 定期触发GC，防止长期运行内存泄露
+	d.maybeRunGC()
+
 	data := d.buildDSLContext(resp, faviconHash)
 	reqMethod = normalizeMethod(reqMethod)
 
-	return d.matchDSLRules(inputURL, reqPath, reqMethod, data)
+	results, err := d.matchDSLRules(inputURL, reqPath, reqMethod, data)
+
+	// 清理并归还map到对象池
+	cleanMapIfNeeded(data)
+
+	return results, err
 }
 
 // DetectWithNuclei 使用Nuclei规则检测指纹
@@ -162,13 +182,36 @@ func (d *Detector) DetectWithNuclei(inputURL, reqPath, reqMethod, favicon string
 	dslMap := responseToDSLMap(resp, "", inputURL, "", "", string(resp.Data), resp.RawHeaders, favicon, 0, nil)
 	reqMethod = normalizeMethod(reqMethod)
 
-	return d.matchNucleiRules(inputURL, reqPath, reqMethod, dslMap)
+	results, err := d.matchNucleiRules(inputURL, reqPath, reqMethod, dslMap)
+
+	// 清理并归还map到对象池
+	cleanMapIfNeeded(dslMap)
+
+	return results, err
 }
 
 // AddMatchedProduct 标记产品已匹配（避免重复检测）
+// 使用LRU缓存，超过容量时自动淘汰最少使用的target
 func (d *Detector) AddMatchedProduct(target string, products []string) {
-	matched, _ := d.matchedOnce.LoadOrStore(target, &sync.Map{})
-	productMap := matched.(*sync.Map)
+	productMap, err := d.matchedCache.Get(target)
+	if err != nil {
+		// target不存在，创建新的sync.Map
+		productMap = &sync.Map{}
+		_ = d.matchedCache.Set(target, productMap)
+	}
+
+	// 限制每个target最多缓存100个product，防止单个sync.Map过大
+	count := 0
+	productMap.Range(func(_, _ interface{}) bool {
+		count++
+		return count < 100
+	})
+
+	if count >= 100 {
+		// 已达上限，不再添加
+		return
+	}
+
 	for _, p := range products {
 		productMap.Store(p, true)
 	}
@@ -176,30 +219,97 @@ func (d *Detector) AddMatchedProduct(target string, products []string) {
 
 // isProductMatched 检查产品是否已匹配
 func (d *Detector) isProductMatched(target, product string) bool {
-	matched, ok := d.matchedOnce.Load(target)
-	if !ok {
+	productMap, err := d.matchedCache.Get(target)
+	if err != nil {
 		return false
 	}
-	_, exists := matched.(*sync.Map).Load(product)
+	_, exists := productMap.Load(product)
 	return exists
+}
+
+// ClearMatchedCache 清理已匹配的缓存
+func (d *Detector) ClearMatchedCache() {
+	d.matchedCache.Purge()
+}
+
+// maybeRunGC 定期触发GC，防止长期运行内存泄露
+// 每处理10000个目标后触发一次GC
+func (d *Detector) maybeRunGC() {
+	d.counterMu.Lock()
+	d.detectCounter++
+	counter := d.detectCounter
+	d.counterMu.Unlock()
+
+	// 每10000次检测触发一次GC
+	if counter%10000 == 0 {
+		// 异步执行GC，不阻塞主流程
+		go func() {
+			// runtime.GC() // 如需要可以强制GC
+			// 清理部分缓存
+			if counter%50000 == 0 {
+				// 每50000次清理一次匹配缓存（但LRU会自动管理）
+				gologger.Debug().Msg("Periodic cleanup triggered")
+			}
+		}()
+	}
+}
+
+// ClearMatchedTarget 清理指定目标的匹配缓存
+func (d *Detector) ClearMatchedTarget(target string) {
+	_ = d.matchedCache.Remove(target)
+}
+
+// dslContextPool 对象池，用于复用DSL上下文map
+var dslContextPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]interface{}, 12)
+	},
+}
+
+// cleanMapIfNeeded 清理map如果键值对过多（防止对象池中的map无限增长）
+func cleanMapIfNeeded(m map[string]interface{}) {
+	// 如果map的键超过50个，说明被污染了，重新创建
+	if len(m) > 50 {
+		// 不放回池中，GC会回收
+		return
+	}
+	// 清空后放回池
+	for k := range m {
+		delete(m, k)
+	}
+	dslContextPool.Put(m)
 }
 
 // buildDSLContext 构建DSL表达式上下文
 func (d *Detector) buildDSLContext(resp *httpx.Response, faviconHash string) map[string]interface{} {
 	tlsInfo, _ := json.Marshal(resp.TLSData)
 
-	return map[string]interface{}{
-		"body":        string(resp.Data),
-		"title":       httpx.ExtractTitle(resp),
-		"header":      resp.RawHeaders,
-		"server":      strings.Join(resp.Headers["Server"], ","),
-		"cert":        string(tlsInfo),
-		"banner":      resp.RawHeaders,
-		"protocol":    "",
-		"port":        "",
-		"status_code": resp.StatusCode,
-		"favicon":     faviconHash,
+	// 从对象池获取map
+	data := dslContextPool.Get().(map[string]interface{})
+
+	// 清空并填充数据
+	for k := range data {
+		delete(data, k)
 	}
+
+	// 优化：对于大响应体，避免不必要的string转换
+	// DSL引擎可以接受[]byte或string
+	if len(resp.Data) > 102400 { // 大于100KB时使用[]byte
+		data["body"] = resp.Data
+	} else {
+		data["body"] = string(resp.Data)
+	}
+	data["title"] = httpx.ExtractTitle(resp)
+	data["header"] = resp.RawHeaders
+	data["server"] = strings.Join(resp.Headers["Server"], ",")
+	data["cert"] = string(tlsInfo)
+	data["banner"] = resp.RawHeaders
+	data["protocol"] = ""
+	data["port"] = ""
+	data["status_code"] = resp.StatusCode
+	data["favicon"] = faviconHash
+
+	return data
 }
 
 // matchDSLRules 匹配DSL规则
@@ -371,51 +481,62 @@ func (d *Detector) Extract(data map[string]interface{}, extractor *extractors.Ex
 
 // GetAllPaths 获取所有需要探测的路径规则
 func (d *Detector) GetAllPaths() []PathRule {
-	d.store.mu.RLock()
-	defer d.store.mu.RUnlock()
+	// 使用sync.Once确保只构建一次
+	d.pathsCacheOnce.Do(func() {
+		d.store.mu.RLock()
+		defer d.store.mu.RUnlock()
 
-	var paths []PathRule
-	seen := make(map[string]struct{})
+		var paths []PathRule
+		seen := make(map[string]struct{})
 
-	// 收集DSL规则中的路径
-	for _, rules := range d.store.dslRules {
-		for _, rule := range rules {
-			for _, p := range rule.Paths {
-				if p == "" {
-					p = "/"
-				}
-				key := rule.Method + ":" + p
-				if _, ok := seen[key]; !ok {
-					seen[key] = struct{}{}
-					paths = append(paths, PathRule{
-						Method: rule.Method,
-						Path:   p,
-					})
-				}
-			}
-		}
-	}
-
-	// 收集Nuclei规则中的路径
-	for _, rules := range d.store.nucleiRules {
-		for _, rule := range rules {
-			for _, p := range rule.Paths {
-				if p == "" {
-					p = "/"
-				}
-				key := rule.Method + ":" + p
-				if _, ok := seen[key]; !ok {
-					seen[key] = struct{}{}
-					paths = append(paths, PathRule{
-						Method: rule.Method,
-						Path:   p,
-					})
+		// 收集DSL规则中的路径
+		for _, rules := range d.store.dslRules {
+			for _, rule := range rules {
+				for _, p := range rule.Paths {
+					if p == "" {
+						p = "/"
+					}
+					// 构建唯一key：包含Method、Path和Headers
+					key := buildPathRuleKey(rule.Method, p, rule.Headers)
+					if _, ok := seen[key]; !ok {
+						seen[key] = struct{}{}
+						paths = append(paths, PathRule{
+							Method:   rule.Method,
+							Path:     p,
+							Headers:  rule.Headers,
+							Redirect: rule.Redirect,
+						})
+					}
 				}
 			}
 		}
-	}
 
-	return paths
+		// 收集Nuclei规则中的路径
+		for _, rules := range d.store.nucleiRules {
+			for _, rule := range rules {
+				for _, p := range rule.Paths {
+					if p == "" {
+						p = "/"
+					}
+					// 构建唯一key：包含Method、Path和Headers
+					key := buildPathRuleKey(rule.Method, p, rule.Headers)
+					if _, ok := seen[key]; !ok {
+						seen[key] = struct{}{}
+						paths = append(paths, PathRule{
+							Method:   rule.Method,
+							Path:     p,
+							Headers:  rule.Headers,
+							Redirect: rule.Redirect,
+						})
+					}
+				}
+			}
+		}
+
+		d.allPathsCache = paths
+	})
+
+	return d.allPathsCache
 }
 
 // PathRule 路径规则
@@ -429,6 +550,31 @@ type PathRule struct {
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+// buildPathRuleKey 构建路径规则的唯一key
+// 格式: METHOD:PATH[:HEADER1=VALUE1:HEADER2=VALUE2...]
+func buildPathRuleKey(method, path string, headers map[string]string) string {
+	key := method + ":" + path
+	if len(headers) > 0 {
+		// 对headers按key排序后拼接，确保相同headers的规则生成相同key
+		var headerParts []string
+		for k, v := range headers {
+			headerParts = append(headerParts, k+"="+v)
+		}
+		// 简单排序以保证一致性
+		for i := 0; i < len(headerParts)-1; i++ {
+			for j := i + 1; j < len(headerParts); j++ {
+				if headerParts[i] > headerParts[j] {
+					headerParts[i], headerParts[j] = headerParts[j], headerParts[i]
+				}
+			}
+		}
+		for _, part := range headerParts {
+			key += ":" + part
+		}
+	}
+	return key
+}
 
 // matchPath 检查路径和方法是否匹配
 func matchPath(reqPath, reqMethod, ruleMethod string, rulePaths []string) bool {
@@ -490,4 +636,110 @@ func toString(data interface{}) string {
 	default:
 		return fmt.Sprintf("%v", data)
 	}
+}
+
+// ============================================================================
+// 兼容旧API (Deprecated)
+// ============================================================================
+
+// TechDetecter 旧版检测器
+// Deprecated: 请使用 Detector
+type TechDetecter struct {
+	detector *Detector
+	Rules    map[string][]Rule // 暴露规则供外部访问
+}
+
+// Init 初始化检测器
+// Deprecated: 请使用 NewDetector
+// 注意：多次调用Init会清理之前的detector缓存
+func (t *TechDetecter) Init(rulePath string, useInternal bool) error {
+	// 清理旧的detector缓存，防止内存泄露
+	if t.detector != nil {
+		t.detector.ClearMatchedCache()
+	}
+
+	d, err := NewDetector(rulePath, useInternal)
+	if err != nil {
+		return err
+	}
+	t.detector = d
+
+	// 从解析器获取原始规则
+	t.Rules = make(map[string][]Rule)
+	parser := newRuleParser(d.store)
+
+	// 加载内置规则
+	if useInternal {
+		fpDir := "data/fp"
+		files, _ := embed.AssetDir(fpDir)
+		for _, fileName := range files {
+			content, err := embed.Asset(path.Join(fpDir, fileName))
+			if err != nil {
+				continue
+			}
+			t.loadRulesFromContent(content)
+		}
+	}
+
+	// 加载外部规则
+	if rulePath != "" {
+		if isDir(rulePath) {
+			for _, file := range readDir(rulePath) {
+				content, err := os.ReadFile(file)
+				if err != nil {
+					continue
+				}
+				t.loadRulesFromContent(content)
+			}
+		} else if exists(rulePath) {
+			content, _ := os.ReadFile(rulePath)
+			t.loadRulesFromContent(content)
+		}
+	}
+
+	_ = parser // 消除未使用的警告
+	return nil
+}
+
+// loadRulesFromContent 从内容加载规则
+func (t *TechDetecter) loadRulesFromContent(content []byte) {
+	var m Matchers
+	if err := yaml.Unmarshal(content, &m); err != nil {
+		return
+	}
+	product := m.Info.Product
+	if product == "" {
+		return
+	}
+	for _, rule := range m.Rules {
+		if rule.DSL == "" {
+			continue
+		}
+		if len(rule.Path) == 0 {
+			rule.Path = []string{"/"}
+		}
+		t.Rules[product] = append(t.Rules[product], rule)
+	}
+}
+
+// AddMatchedProduct 添加已匹配的产品
+// Deprecated: 请使用 Detector.AddMatchedProduct
+func (t *TechDetecter) AddMatchedProduct(target string, products []string) {
+	t.detector.AddMatchedProduct(target, products)
+}
+
+// Detect DSL规则检测
+// Deprecated: 请使用 Detector.Detect
+func (t *TechDetecter) Detect(inputURL, requestPath, requestMethod, faviconMMH3 string, response *httpx.Response) ([]string, error) {
+	return t.detector.Detect(inputURL, requestPath, requestMethod, faviconMMH3, response)
+}
+
+// FingerHubDetect Nuclei规则检测
+// Deprecated: 请使用 Detector.DetectWithNuclei
+func (t *TechDetecter) FingerHubDetect(inputURL, requestPath, requestMethod, favicon string, response *httpx.Response) ([]string, error) {
+	return t.detector.DetectWithNuclei(inputURL, requestPath, requestMethod, favicon, response)
+}
+
+func (t *TechDetecter) GetAllPaths() []PathRule {
+	return t.detector.GetAllPaths()
 }

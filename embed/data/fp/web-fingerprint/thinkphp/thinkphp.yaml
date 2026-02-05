@@ -1,0 +1,28 @@
+id: thinkphp
+info:
+  name: thinkphp
+  author: cn-kali-team
+  tags: detect,tech,thinkphp
+  severity: info
+  metadata:
+    product: thinkphp
+    vendor: thinkphp
+    verified: true
+http:
+- method: GET
+  path:
+  - '{{BaseURL}}/'
+  matchers:
+  - type: word
+    words:
+    - href="http://www.thinkphp.cn">thinkphp</a>
+    - thinkphp_show_page_trace
+    - https://e.topthink.com/Public/static/client.js
+    - 十年磨一剑 - 为API开发设计的高性能框架
+  
+    case-insensitive: true
+  - type: word
+    words:
+    - 'x-powered-by: thinkphp'
+    part: header
+    case-insensitive: true

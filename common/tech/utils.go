@@ -13,7 +13,13 @@ import (
 
 // responseToDSLMap 将HTTP响应转换为DSL上下文
 func responseToDSLMap(resp *httpx.Response, host, matched, rawReq, rawResp, body, headers, favicon string, duration time.Duration, extra map[string]interface{}) map[string]interface{} {
-	data := make(map[string]interface{}, 12+len(extra)+len(resp.Headers))
+	// 从对象池获取map
+	data := dslContextPool.Get().(map[string]interface{})
+	
+	// 清空并预分配容量
+	for k := range data {
+		delete(data, k)
+	}
 
 	// 添加额外数据
 	for k, v := range extra {
@@ -70,14 +76,22 @@ func isDir(path string) bool {
 }
 
 // readDir 递归读取目录下所有文件
+// 为防止内存过度使用，限制最多读取50000个文件
 func readDir(path string) []string {
+	const maxFiles = 50000
 	var files []string
+	count := 0
+
 	_ = filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		if !info.IsDir() {
+			if count >= maxFiles {
+				return filepath.SkipDir
+			}
 			files = append(files, p)
+			count++
 		}
 		return nil
 	})

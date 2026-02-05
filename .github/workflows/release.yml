@@ -1,0 +1,206 @@
+name: 🎉 httpx Release Build & Publish
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  PROJECT_NAME: httpx
+  MAIN_PATH: ./cmd/httpx
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: 386
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+          - runner: ubuntu-latest
+            goos: windows
+            goarch: 386
+
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      CGO_ENABLED: 0
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+          cache: true
+
+      - name: Get dependencies
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Get version info
+        id: version
+        run: |
+          echo "githash=$(git rev-parse --short=8 HEAD)" >> $GITHUB_OUTPUT
+          echo "gittag=$(git describe --tags --abbrev=0 2>/dev/null || echo 'v0.0.0')" >> $GITHUB_OUTPUT
+          echo "datetime=$(date -u '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          
+          BIN_NAME="${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BIN_NAME="$BIN_NAME.exe"
+          fi
+          
+          LD_FLAGS="-s -w \
+            -X 'main.Version=${{ steps.version.outputs.gittag }}' \
+            -X 'main.BuildTime=${{ steps.version.outputs.datetime }}' \
+            -X 'main.GitCommit=${{ steps.version.outputs.githash }}'"
+          
+          LD_FLAGS="$LD_FLAGS -extldflags '-static'"
+          
+          echo "Building ${{ env.PROJECT_NAME }} for ${{ matrix.goos }}/${{ matrix.goarch }}"
+          go build -trimpath -ldflags "$LD_FLAGS" -o "dist/$BIN_NAME" ${{ env.MAIN_PATH }}
+          
+          # Show binary info
+          ls -lh "dist/$BIN_NAME"
+          file "dist/$BIN_NAME" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release info
+        id: release_info
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            RELEASE_NAME="Release $TAG"
+            IS_PRERELEASE="false"
+          else
+            TAG="dev-${GITHUB_SHA:0:8}"
+            RELEASE_NAME="Development Build ${GITHUB_SHA:0:8}"
+            IS_PRERELEASE="true"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          
+          # Generate release notes
+          echo "## Release: ${{ env.PROJECT_NAME }} $TAG" > release_notes.md
+          echo "" >> release_notes.md
+          echo "### Build Information" >> release_notes.md
+          echo "- **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> release_notes.md
+          echo "- **Commit:** ${GITHUB_SHA:0:8}" >> release_notes.md
+          echo "- **Commit URL:** https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### Supported Platforms" >> release_notes.md
+          echo "- ✅ Windows (amd64, 386)" >> release_notes.md
+          echo "- ✅ Linux (amd64, arm64, 386)" >> release_notes.md
+          echo "- ✅ macOS (amd64, arm64)" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### Installation" >> release_notes.md
+          echo "Download the appropriate binary for your platform:" >> release_notes.md
+          echo "\`\`\`bash" >> release_notes.md
+          echo "# Linux/macOS" >> release_notes.md
+          echo "chmod +x ${{ env.PROJECT_NAME }}-*" >> release_notes.md
+          echo "./${{ env.PROJECT_NAME }}-* -version" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "# Windows" >> release_notes.md
+          echo "${{ env.PROJECT_NAME }}-windows-amd64.exe -version" >> release_notes.md
+          echo "\`\`\`" >> release_notes.md
+
+      - name: Create and push tag (if not a tag event)
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          TAG="${{ steps.release_info.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, deleting old tag"
+            git push --delete origin "$TAG" || true
+          fi
+          
+          echo "Creating tag $TAG"
+          git tag -a "$TAG" -m "Development release $TAG" -m "Auto-generated from ${{ github.ref_name }} branch"
+          git push origin "$TAG"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-assets
+          find dist -type f -name "${{ env.PROJECT_NAME }}-*" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+          
+          # Create checksums
+          cd release-assets
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.release_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ steps.release_info.outputs.is_prerelease }}
+          files: release-assets/**
+          generate_release_notes: true
+          append_body: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
