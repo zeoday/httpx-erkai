@@ -34,11 +34,11 @@ import (
 	"github.com/mfonda/simhash"
 	asnmap "github.com/projectdiscovery/asnmap/libs"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
+	"github.com/projectdiscovery/httpx/common/authprovider"
 	"github.com/projectdiscovery/httpx/common/customextract"
 	"github.com/projectdiscovery/httpx/common/hashes/jarm"
 	"github.com/projectdiscovery/httpx/common/inputformats"
 	"github.com/projectdiscovery/httpx/common/pagetypeclassifier"
-	"github.com/projectdiscovery/httpx/common/authprovider"
 	"github.com/projectdiscovery/httpx/common/tech"
 	"github.com/projectdiscovery/httpx/static"
 	"github.com/projectdiscovery/mapcidr/asn"
@@ -2267,7 +2267,7 @@ retry:
 			technologies = append(technologies, product...)
 			r.techAnalyzer.AddMatchedProduct(fullURL, product)
 		}
-		if r.options.AvtiveDetection {
+		if r.options.ActiveDetection {
 			var mu sync.Mutex
 			var ctx, cancel = context.WithCancel(context.Background())
 			defer cancel()
